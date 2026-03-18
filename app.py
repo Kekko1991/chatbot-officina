@@ -58,6 +58,31 @@ if GOOGLE_CREDS:
     except Exception as e:
         logger.warning('Google Calendar non disponibile: ' + str(e))
 
+# --- DEDUPLICAZIONE MESSAGGI ---
+processed_messages = {}
+
+def is_duplicate(msg_id):
+    """Evita di processare lo stesso messaggio due volte."""
+    if not msg_id:
+        return False
+    if msg_id in processed_messages:
+        return True
+    # Pulisci messaggi vecchi (> 5 minuti)
+    now = datetime.now()
+    to_remove = [k for k, v in processed_messages.items() if (now - v).seconds > 300]
+    for k in to_remove:
+        processed_messages.pop(k, None)
+    processed_messages[msg_id] = now
+    return False
+
+# --- LOCK PER UTENTE (evita risposte sovrapposte) ---
+user_locks = {}
+
+def get_user_lock(phone):
+    if phone not in user_locks:
+        user_locks[phone] = threading.Lock()
+    return user_locks[phone]
+
 # --- STORAGE ---
 conversations = {}
 triage_data_store = {}
@@ -88,30 +113,28 @@ def send_whatsapp_message(to_number, text):
         return False
 
 # --- SYSTEM PROMPT ---
-SYSTEM_PROMPT = '''Sei l'assistente virtuale dell'officina del concessionario ''' + NOME + '''.
-Indirizzo officina: ''' + INDIRIZZO + '''
-Telefono officina: ''' + TELEFONO + '''
+SYSTEM_PROMPT = '''Sei l'assistente WhatsApp dell'officina ''' + NOME + ''' (''' + INDIRIZZO + ''', tel. ''' + TELEFONO + ''').
 
-Il tuo compito e':
-1. ACCOGLIERE il cliente in modo cordiale e professionale
-2. CAPIRE il problema con domande mirate (max 2-3 domande)
-3. CLASSIFICARE la gravita' e proporre l'appuntamento
+COMPITO: capire il problema auto del cliente e classificarlo per fissare un appuntamento.
 
-REGOLE:
-- Sii cordiale ma conciso, max 2-3 frasi per messaggio
-- Fai UNA domanda alla volta
-- Linguaggio semplice, dai del "Lei"
+REGOLE IMPORTANTI:
+- Rispondi SEMPRE in 1-2 frasi brevi. MAI piu' di 3 frasi.
+- NON salutare se il cliente ha gia' descritto un problema. Vai dritto alla domanda.
+- Saluta SOLO se il cliente scrive "ciao" o un saluto generico senza descrivere problemi.
+- Fai UNA domanda alla volta.
+- Dai del "Lei".
+- NON ripetere quello che il cliente ha detto.
 
-QUANDO HAI ABBASTANZA INFO (dopo 2-3 scambi), rispondi SOLO con JSON:
+DOPO 2-3 SCAMBI, rispondi SOLO con questo JSON (niente altro testo):
 {"triage_complete":true,"priority":"CRITICA|ALTA|MEDIA|BASSA","category":"motore|trasmissione|freni|sterzo|sospensioni|impianto_elettrico|climatizzazione|carrozzeria|pneumatici|luci|tergicristalli|batteria|scarico|tagliando|altro","summary":"Breve descrizione","recommendation":"Cosa consigliamo"}
 
 PRIORITA':
-- CRITICA: Sicurezza compromessa, veicolo non guidabile
-- ALTA: Problema serio ma utilizzabile con cautela
-- MEDIA: Da risolvere ma non urgente
-- BASSA: Manutenzione ordinaria o estetica
+- CRITICA: veicolo non guidabile, sicurezza compromessa
+- ALTA: problema serio ma utilizzabile con cautela
+- MEDIA: da risolvere ma non urgente
+- BASSA: manutenzione ordinaria o estetica
 
-NON classificare al primo messaggio. Fai ALMENO 1-2 domande prima.'''
+NON classificare al primo messaggio. Fai ALMENO 1 domanda prima.'''
 
 # --- SLOT E PRIORITA' ---
 PRIORITY_CONFIG = {
@@ -324,10 +347,22 @@ def webhook():
         if not msgs:
             return 'OK', 200
         msg = msgs[0]
+        msg_id = msg.get('id', '')
         phone = msg.get('from', '')
+
+        # Evita messaggi duplicati
+        if is_duplicate(msg_id):
+            logger.info('Duplicato ignorato: ' + msg_id)
+            return 'OK', 200
+
         if msg.get('type') == 'text':
             text = msg.get('text', {}).get('body', '').strip()
-            threading.Thread(target=lambda: send_whatsapp_message(phone, process_message(phone, text)), daemon=True).start()
+            def process_and_send():
+                lock = get_user_lock(phone)
+                with lock:
+                    reply = process_message(phone, text)
+                    send_whatsapp_message(phone, reply)
+            threading.Thread(target=process_and_send, daemon=True).start()
         else:
             send_whatsapp_message(phone, 'Posso elaborare solo messaggi di testo.')
     except Exception as e:
@@ -338,3 +373,4 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     logger.info('🚀 ' + NOME + ' avviato sulla porta ' + str(port))
     app.run(host='0.0.0.0', port=port)
+
