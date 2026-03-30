@@ -217,7 +217,7 @@ REGOLE DI COMUNICAZIONE:
 - NON suggerire MAI al cliente di chiamare l'officina o di farsi richiamare. Tu gestisci TUTTO: prenotazioni, spostamenti, cancellazioni. Se il cliente chiede di spostare o cancellare un appuntamento, digli che puo' farlo direttamente qui in chat.
 
 DOPO 2-3 SCAMBI, rispondi SOLO con questo JSON (niente altro testo):
-{"triage_complete":true,"priority":"CRITICA|ALTA|MEDIA|BASSA","category":"motore|trasmissione|freni|sterzo|sospensioni|impianto_elettrico|climatizzazione|carrozzeria|pneumatici|luci|tergicristalli|batteria|scarico|tagliando|altro","summary":"Breve descrizione","recommendation":"Cosa consigliamo","emotional_note":"Stato emotivo del cliente: calmo|preoccupato|ansioso|in_panico"}
+{"triage_complete":true,"priority":"CRITICA|ALTA|MEDIA|BASSA","category":"motore|trasmissione|freni|sterzo|sospensioni|impianto_elettrico|climatizzazione|carrozzeria|pneumatici|luci|tergicristalli|batteria|scarico|tagliando|altro","summary":"Breve descrizione","recommendation":"Cosa consigliamo","emotional_note":"Stato emotivo del cliente: calmo|preoccupato|ansioso|in_panico","preferred_datetime":"SOLO se il cliente ha indicato una data/ora preferita, scrivi qui in formato YYYY-MM-DD HH:MM. Altrimenti null."}
 
 PRIORITA':
 - CRITICA: veicolo non guidabile, sicurezza compromessa
@@ -293,7 +293,7 @@ def is_slot_free(slot_start, slot_end, busy_times):
             return False
     return True
 
-def genera_slot(priority):
+def genera_slot(priority, all_slots=False):
     config = PRIORITY_CONFIG[priority]
     min_days = config.get('min_days', 0)
     max_days = config['max_days']
@@ -322,6 +322,8 @@ def genera_slot(priority):
                 'date': date.strftime('%Y-%m-%d'), 'time': orario,
                 'datetime_start': si, 'datetime_end': ei,
             })
+    if all_slots:
+        return slots
     n = config['slots']
     if len(slots) <= n:
         return slots
@@ -337,9 +339,32 @@ CATEGORY_LABELS = {
     'tagliando': 'Tagliando', 'altro': 'Altro',
 }
 
+def _find_preferred_slot(slots, preferred_datetime):
+    """Cerca tra gli slot generati quello che corrisponde alla data/ora preferita dal cliente."""
+    if not preferred_datetime or not slots:
+        return None
+    try:
+        pref = datetime.strptime(preferred_datetime, '%Y-%m-%d %H:%M')
+    except (ValueError, TypeError):
+        return None
+    pref_date = pref.strftime('%Y-%m-%d')
+    pref_time = pref.strftime('%H:%M')
+    # Cerca corrispondenza esatta
+    for slot in slots:
+        if slot['date'] == pref_date and slot['time'] == pref_time:
+            return slot
+    # Se l'orario esatto non c'e', cerca lo slot piu' vicino nello stesso giorno
+    same_day = [s for s in slots if s['date'] == pref_date]
+    if same_day:
+        return min(same_day, key=lambda s: abs(int(s['time'].replace(':', '')) - int(pref_time.replace(':', ''))))
+    return None
+
 def formatta_triage(triage):
     pri = triage['priority']
     config = PRIORITY_CONFIG[pri]
+    preferred = triage.get('preferred_datetime')
+    # Se c'e' un orario preferito, genera tutti gli slot per cercare la corrispondenza
+    all_slots = genera_slot(pri, all_slots=True) if preferred else None
     slots = genera_slot(pri)
     msg = config['emoji'] + ' *VALUTAZIONE: Priorita\' ' + config['label'] + '*\n\n'
     if pri == 'CRITICA':
@@ -351,6 +376,13 @@ def formatta_triage(triage):
         msg += '\u26a0\ufe0f Nessuno slot disponibile al momento.\n'
         msg += 'Ci contatti al ' + TELEFONO + ' per fissare un appuntamento.'
         return msg, []
+    # Se il cliente ha indicato un orario preferito, usa direttamente quello
+    if preferred and all_slots:
+        matched = _find_preferred_slot(all_slots, preferred)
+        if matched:
+            msg += '\U0001f4c5 Perfetto, abbiamo disponibilita\' per *' + matched['display'] + '*.\n\n'
+            msg += 'Confermiamo questo orario?'
+            return msg, [matched]
     msg += '\U0001f4c5 *Slot disponibili:*\n'
     for i, slot in enumerate(slots, 1):
         msg += '  *' + str(i) + '.* ' + slot['display'] + '\n'
