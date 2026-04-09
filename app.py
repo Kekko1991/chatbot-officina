@@ -7,7 +7,7 @@ import logging
 import threading
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from flask import Flask, request
+from flask import Flask, request, render_template_string, redirect, session
 import anthropic
 import tempfile
 import requests as req
@@ -32,6 +32,10 @@ NOME = os.environ.get('NOME_CONCESSIONARIO', 'AutoPlus')
 INDIRIZZO = os.environ.get('INDIRIZZO', 'Via Roma 123, 80100 Napoli')
 TELEFONO = os.environ.get('TELEFONO_OFFICINA', '+39 081 123 4567')
 WHATSAPP_OFFICINA = os.environ.get('WHATSAPP_OFFICINA', '+393312782211')
+ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', 'brocar')
+TEMPLATE_NAME = os.environ.get('TEMPLATE_NAME', 'auto_pronta')
+TEMPLATE_PROMEMORIA = os.environ.get('TEMPLATE_PROMEMORIA', 'promemoria_appuntamento')
+TEMPLATE_NON_PRONTA = os.environ.get('TEMPLATE_NON_PRONTA', 'auto_non_pronta')
 
 ORARIO_APERTURA = os.environ.get('ORARIO_APERTURA', '08:30')
 ORARIO_CHIUSURA = os.environ.get('ORARIO_CHIUSURA', '17:00')
@@ -39,6 +43,7 @@ PAUSA_INIZIO = os.environ.get('PAUSA_PRANZO_INIZIO', '13:00')
 PAUSA_FINE = os.environ.get('PAUSA_PRANZO_FINE', '14:00')
 SABATO_CHIUSURA = os.environ.get('SABATO_CHIUSURA', '13:00')
 DURATA_SLOT = int(os.environ.get('DURATA_SLOT_MINUTI', '60'))
+MAX_APPUNTAMENTI_SETTIMANA = int(os.environ.get('MAX_APPUNTAMENTI_SETTIMANA', '3'))
 TZ_ROME = ZoneInfo('Europe/Rome')
 
 # --- CLIENTS ---
@@ -70,7 +75,8 @@ def crea_evento_calendar(slot, nome_cliente, triage_data):
         sommario += ' - ' + auto
     if categoria:
         sommario += ' (' + categoria + ')'
-    descrizione = 'Cliente: ' + nome_cliente + '\n'
+    descrizione = 'CONSEGNA AUTO (ricovero 24-72h)\n\n'
+    descrizione += 'Cliente: ' + nome_cliente + '\n'
     if auto:
         descrizione += 'Veicolo: ' + auto + '\n'
     if pri:
@@ -120,33 +126,45 @@ META_HEADERS = {
 # --- TRASCRIZIONE VOCALI ---
 openai_client = openai.OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-def transcribe_audio(media_id):
-    """Scarica un vocale da Meta e lo trascrive con Whisper."""
+def download_media(media_id):
+    """Scarica un media da Meta e ritorna i bytes e il content type."""
     try:
-        # 1. Ottieni URL del media da Meta
         media_resp = req.get(
             'https://graph.facebook.com/v21.0/' + media_id,
             headers={'Authorization': 'Bearer ' + META_ACCESS_TOKEN},
             timeout=10
         )
-        media_url = media_resp.json().get('url')
+        media_info = media_resp.json()
+        media_url = media_info.get('url')
+        mime_type = media_info.get('mime_type', '')
         if not media_url:
-            logger.error('Trascrizione: URL media non trovato per ' + media_id)
-            return None
+            logger.error('Media: URL non trovato per ' + media_id)
+            return None, None
 
-        # 2. Scarica il file audio
-        audio_resp = req.get(
+        data_resp = req.get(
             media_url,
             headers={'Authorization': 'Bearer ' + META_ACCESS_TOKEN},
             timeout=30
         )
-        if not audio_resp.ok:
-            logger.error('Trascrizione: download audio fallito - ' + str(audio_resp.status_code))
+        if not data_resp.ok:
+            logger.error('Media: download fallito - ' + str(data_resp.status_code))
+            return None, None
+
+        return data_resp.content, mime_type
+    except Exception as e:
+        logger.error('Errore download media: ' + str(e))
+        return None, None
+
+
+def transcribe_audio(media_id):
+    """Scarica un vocale da Meta e lo trascrive con Whisper."""
+    try:
+        audio_data, _ = download_media(media_id)
+        if not audio_data:
             return None
 
-        # 3. Salva in file temporaneo e trascrivi con Whisper
         with tempfile.NamedTemporaryFile(suffix='.ogg', delete=False) as tmp:
-            tmp.write(audio_resp.content)
+            tmp.write(audio_data)
             tmp_path = tmp.name
 
         try:
@@ -164,6 +182,23 @@ def transcribe_audio(media_id):
     except Exception as e:
         logger.error('Errore trascrizione vocale: ' + str(e))
         return None
+
+
+import base64
+
+def download_image_as_base64(media_id):
+    """Scarica un'immagine da Meta e la ritorna come base64 con il media type."""
+    image_data, mime_type = download_media(media_id)
+    if not image_data:
+        return None, None
+    # Meta restituisce mime_type tipo "image/jpeg", "image/png" ecc.
+    if not mime_type:
+        mime_type = 'image/jpeg'
+    # Claude accetta: image/jpeg, image/png, image/gif, image/webp
+    media_type = mime_type.split(';')[0].strip()
+    b64 = base64.b64encode(image_data).decode('utf-8')
+    logger.info('Immagine scaricata: ' + media_type + ', ' + str(len(image_data)) + ' bytes')
+    return b64, media_type
 
 # --- LOCK PER UTENTE (evita risposte sovrapposte) ---
 user_locks = {}
@@ -191,6 +226,33 @@ def send_whatsapp_message(to_number, text):
         logger.error('Invio errore: ' + str(e))
         return False
 
+def send_template_message(to_number, template_name, params):
+    """Invia un messaggio template WhatsApp (per messaggi proattivi oltre le 24h)."""
+    payload = {
+        'messaging_product': 'whatsapp',
+        'to': to_number,
+        'type': 'template',
+        'template': {
+            'name': template_name,
+            'language': {'code': 'it'},
+            'components': [
+                {
+                    'type': 'body',
+                    'parameters': [{'type': 'text', 'text': p} for p in params]
+                }
+            ]
+        }
+    }
+    try:
+        r = req.post(META_API_URL, headers=META_HEADERS, json=payload)
+        if r.status_code != 200:
+            logger.error('Template errore: ' + str(r.status_code) + ' ' + r.text)
+            return False, r.text
+        return True, 'OK'
+    except Exception as e:
+        logger.error('Template invio errore: ' + str(e))
+        return False, str(e)
+
 # --- SYSTEM PROMPT ---
 SYSTEM_PROMPT = '''Sei l'assistente WhatsApp dell'officina ''' + NOME + ''' (''' + INDIRIZZO + ''', tel. ''' + TELEFONO + ''').
 
@@ -217,7 +279,13 @@ REGOLE DI COMUNICAZIONE:
 - NON suggerire MAI al cliente di chiamare l'officina o di farsi richiamare. Tu gestisci TUTTO: prenotazioni, spostamenti, cancellazioni. Se il cliente chiede di spostare o cancellare un appuntamento, digli che puo' farlo direttamente qui in chat.
 
 DOPO 2-3 SCAMBI, rispondi SOLO con questo JSON (niente altro testo):
-{"triage_complete":true,"priority":"CRITICA|ALTA|MEDIA|BASSA","category":"motore|trasmissione|freni|sterzo|sospensioni|impianto_elettrico|climatizzazione|carrozzeria|pneumatici|luci|tergicristalli|batteria|scarico|tagliando|altro","summary":"Breve descrizione","recommendation":"Cosa consigliamo","emotional_note":"Stato emotivo del cliente: calmo|preoccupato|ansioso|in_panico","preferred_datetime":"SOLO se il cliente ha indicato una data/ora preferita, scrivi qui in formato YYYY-MM-DD HH:MM. Altrimenti null."}
+{"triage_complete":true,"priority":"CRITICA|ALTA|MEDIA|BASSA","category":"motore|trasmissione|freni|sterzo|sospensioni|impianto_elettrico|climatizzazione|carrozzeria|pneumatici|luci|tergicristalli|batteria|scarico|altro","summary":"Breve descrizione","recommendation":"Cosa consigliamo","emotional_note":"Stato emotivo del cliente: calmo|preoccupato|ansioso|in_panico","preferred_datetime":"SOLO se il cliente ha indicato una data/ora preferita, scrivi qui in formato YYYY-MM-DD HH:MM. Altrimenti null."}
+
+RICOVERO AUTO:
+- L'officina accetta auto SOLO dal lunedi' al mercoledi' (consegna).
+- L'auto resta in officina per un ricovero di 24-72 ore.
+- Massimo 3 appuntamenti a settimana.
+- Spiega al cliente che l'auto sara' in ricovero e che verra' contattato quando e' pronta.
 
 PRIORITA':
 - CRITICA: veicolo non guidabile, sicurezza compromessa
@@ -225,19 +293,25 @@ PRIORITA':
 - MEDIA: da risolvere ma non urgente
 - BASSA: manutenzione ordinaria o estetica
 
+FOTO:
+- Se il problema e' VISIVO (spia accesa, graffio, ammaccatura, danno carrozzeria, pneumatico danneggiato, pezzo rotto visibile, perdita liquido), chiedi al cliente di mandare una foto. Dì qualcosa come: "Se puo', mi mandi una foto cosi' posso capire meglio la situazione."
+- Se il problema e' INTERNO/MECCANICO (rumore, vibrazione, problema avviamento, freni che tirano, cambio duro, ecc.), NON chiedere foto perche' non servirebbero.
+- La foto NON e' mai obbligatoria. Se il cliente non la manda, prosegui normalmente.
+- Se il cliente manda una foto, analizzala attentamente e usala per migliorare la tua valutazione.
+
 NON classificare al primo messaggio. Fai ALMENO 1 domanda prima.'''
 
 # --- SLOT E PRIORITA' ---
 PRIORITY_CONFIG = {
-    'CRITICA': {'emoji': '\U0001f534', 'label': 'URGENTE', 'min_days': 0, 'max_days': 2, 'slots': 4},
-    'ALTA':    {'emoji': '\U0001f7e0', 'label': 'PRIORITARIO', 'min_days': 0, 'max_days': 4, 'slots': 3},
-    'MEDIA':   {'emoji': '\U0001f7e1', 'label': 'NORMALE', 'min_days': 0, 'max_days': 7, 'slots': 3},
-    'BASSA':   {'emoji': '\U0001f7e2', 'label': 'BASSA', 'min_days': 15, 'max_days': 30, 'slots': 3},
+    'CRITICA': {'emoji': '\U0001f534', 'label': 'URGENTE', 'min_days': 0, 'max_days': 7, 'slots': 3},
+    'ALTA':    {'emoji': '\U0001f7e0', 'label': 'PRIORITARIO', 'min_days': 0, 'max_days': 14, 'slots': 3},
+    'MEDIA':   {'emoji': '\U0001f7e1', 'label': 'NORMALE', 'min_days': 0, 'max_days': 21, 'slots': 3},
+    'BASSA':   {'emoji': '\U0001f7e2', 'label': 'BASSA', 'min_days': 14, 'max_days': 42, 'slots': 3},
 }
 
 GIORNI = ['Lun','Mar','Mer','Gio','Ven','Sab','Dom']
 MESI = ['Gen','Feb','Mar','Apr','Mag','Giu','Lug','Ago','Set','Ott','Nov','Dic']
-GIORNI_LAVORATIVI = [0, 1, 2, 3, 4, 5]
+GIORNI_LAVORATIVI = [0, 1, 2]  # Solo Lun, Mar, Mer (consegna auto)
 
 def genera_orari_giornata(weekday):
     ap_h, ap_m = map(int, ORARIO_APERTURA.split(':'))
@@ -293,18 +367,56 @@ def is_slot_free(slot_start, slot_end, busy_times):
             return False
     return True
 
+def _distribuisci_slot(slots, n):
+    """Distribuisce N slot su giorni diversi quando possibile, con orari ben spaziati."""
+    if len(slots) <= n:
+        return slots
+    # Raggruppa per data
+    by_date = {}
+    for s in slots:
+        by_date.setdefault(s['date'], []).append(s)
+    dates = sorted(by_date.keys())
+    selected = []
+    # Prima passata: uno slot per giorno (prendi orario centrale della giornata)
+    for d in dates:
+        if len(selected) >= n:
+            break
+        day_slots = by_date[d]
+        mid = len(day_slots) // 2
+        selected.append(day_slots[mid])
+    # Se servono altri slot, prendi da giorni gia' usati (orari diversi)
+    if len(selected) < n:
+        for d in dates:
+            if len(selected) >= n:
+                break
+            day_slots = by_date[d]
+            for s in day_slots:
+                if s not in selected and len(selected) < n:
+                    selected.append(s)
+    selected.sort(key=lambda s: (s['date'], s['time']))
+    return selected
+
+
 def genera_slot(priority, all_slots=False):
     config = PRIORITY_CONFIG[priority]
     min_days = config.get('min_days', 0)
     max_days = config['max_days']
     now = datetime.now(TZ_ROME)
+    date_start = (now + timedelta(days=min_days)).strftime('%Y-%m-%d')
+    date_end = (now + timedelta(days=max_days)).strftime('%Y-%m-%d')
     time_min = (now + timedelta(days=min_days)).isoformat()
     time_max = (now + timedelta(days=max_days + 1)).isoformat()
     busy_times = get_busy_times(time_min, time_max)
+    # Conta prenotazioni per settimana per rispettare il limite
+    weekly_counts = db.count_bookings_by_week(date_start, date_end)
     slots = []
     for delta in range(min_days, max_days + 1):
         date = now + timedelta(days=delta)
         if date.weekday() not in GIORNI_LAVORATIVI:
+            continue
+        # Controlla limite settimanale (max 3 appuntamenti lun-dom)
+        week_start = (date - timedelta(days=date.weekday())).strftime('%Y-%m-%d')
+        if weekly_counts.get(week_start, 0) >= MAX_APPUNTAMENTI_SETTIMANA:
             continue
         for orario in genera_orari_giornata(date.weekday()):
             h, m = map(int, orario.split(':'))
@@ -325,10 +437,7 @@ def genera_slot(priority, all_slots=False):
     if all_slots:
         return slots
     n = config['slots']
-    if len(slots) <= n:
-        return slots
-    step = len(slots) // n
-    return [slots[i * step] for i in range(n)]
+    return _distribuisci_slot(slots, n)
 
 CATEGORY_LABELS = {
     'motore': 'Motore', 'trasmissione': 'Trasmissione', 'freni': 'Freni',
@@ -336,7 +445,7 @@ CATEGORY_LABELS = {
     'impianto_elettrico': 'Impianto Elettrico', 'climatizzazione': 'Climatizzazione',
     'carrozzeria': 'Carrozzeria', 'pneumatici': 'Pneumatici', 'luci': 'Luci',
     'tergicristalli': 'Tergicristalli', 'batteria': 'Batteria', 'scarico': 'Scarico',
-    'tagliando': 'Tagliando', 'altro': 'Altro',
+    'altro': 'Altro',
 }
 
 def _find_preferred_slot(slots, preferred_datetime):
@@ -383,7 +492,8 @@ def formatta_triage(triage):
             msg += '\U0001f4c5 Perfetto, abbiamo disponibilita\' per *' + matched['display'] + '*.\n\n'
             msg += 'Confermiamo questo orario?'
             return msg, [matched]
-    msg += '\U0001f4c5 *Slot disponibili:*\n'
+    msg += '\U0001f504 L\'auto restera\' in officina per un ricovero di 24-72 ore.\n\n'
+    msg += '\U0001f4c5 *Quando puo\' portare l\'auto?*\n'
     for i, slot in enumerate(slots, 1):
         msg += '  *' + str(i) + '.* ' + slot['display'] + '\n'
     msg += '\n\U0001f449 Risponda con il *numero* dello slot (es. "1")'
@@ -400,10 +510,13 @@ def conferma_prenotazione(phone, pending):
     triage_data['auto_cliente'] = auto
     google_event_id = crea_evento_calendar(slot, nome, triage_data)
     booking_id = db.create_booking(phone, slot, triage_id, nome, auto, google_event_id)
+    # Collega le foto inviate durante il triage a questa prenotazione
+    db.link_photos_to_booking(phone, booking_id)
     msg = '\u2705 *Appuntamento Confermato!*\n\n'
     msg += '\U0001f464 *Cliente:* ' + nome + '\n'
     msg += '\U0001f697 *Veicolo:* ' + auto + '\n'
-    msg += '\U0001f4c5 ' + slot['display'] + '\n'
+    msg += '\U0001f4c5 *Consegna:* ' + slot['display'] + '\n'
+    msg += '\U0001f504 *Ricovero:* l\'auto restera\' in officina 24-72 ore. La contatteremo quando sara\' pronta.\n'
     msg += '\U0001f4cd ' + INDIRIZZO + '\n\U0001f4de ' + TELEFONO
     msg += '\n\nRicevera\' un promemoria il giorno prima.\nGrazie e a presto! \U0001f44b'
     # Invia messaggio conferma, poi dopo un attimo il messaggio feedback separato
@@ -626,13 +739,20 @@ def avvia_flusso_modifica(phone, messages):
     db.save_conversation(phone, messages or [], reschedule_pending)
     return '\U0001f50d Per sicurezza, mi indichi la *targa* del veicolo prenotato.'
 
+def _save_photo_for_booking(phone, b64_data, media_type):
+    """Salva la foto nel DB (senza booking_id, verra' collegata dopo)."""
+    try:
+        db.save_photo(phone, b64_data, media_type)
+        logger.info('Foto salvata per ' + phone)
+    except Exception as e:
+        logger.error('Errore salvataggio foto: ' + str(e))
+
+
 WELCOME_MSG = ('Benvenuto nell\'assistenza *' + NOME + '*! \U0001f697\n'
-    'Sono il suo assistente digitale, disponibile 24 ore su 24.\n'
     'Come posso aiutarla? Scelga un\'opzione o mi descriva il suo problema:\n\n'
     '1\ufe0f\u20e3 Ho un problema con la mia auto\n'
-    '2\ufe0f\u20e3 Vorrei prenotare un tagliando\n'
-    '3\ufe0f\u20e3 Vorrei spostare o cancellare un appuntamento\n'
-    '4\ufe0f\u20e3 Informazioni e orari officina\n\n'
+    '2\ufe0f\u20e3 Vorrei spostare o cancellare un appuntamento\n'
+    '3\ufe0f\u20e3 Informazioni e orari officina\n\n'
     'Puo\' anche scrivermi liberamente il suo problema e lo gestiro\' subito!')
 
 INFO_MSG = ('\U0001f3e2 *' + NOME + '*\n\n'
@@ -645,8 +765,8 @@ INFO_MSG = ('\U0001f3e2 *' + NOME + '*\n\n'
     '  Domenica: Chiuso\n\n'
     'Per qualsiasi necessita\', ci scriva pure qui in chat!')
 
-def process_message(from_number, incoming_msg):
-    logger.info('\U0001f4e9 ' + from_number + ': ' + incoming_msg)
+def process_message(from_number, incoming_msg, image=None):
+    logger.info('\U0001f4e9 ' + from_number + ': ' + incoming_msg + (' [+foto]' if image else ''))
     if incoming_msg.lower() in ['reset', 'ricomincia', 'riparti']:
         db.clear_conversation(from_number)
         claude_msgs = [{'role': 'user', 'content': incoming_msg}, {'role': 'assistant', 'content': WELCOME_MSG}]
@@ -657,18 +777,15 @@ def process_message(from_number, incoming_msg):
     if not messages and not pending_slots:
         msg_stripped = incoming_msg.strip()
         # Se l'utente sceglie direttamente un'opzione del menu, mostra welcome + gestisci subito
-        if msg_stripped in ['1', '2', '3', '4']:
+        if msg_stripped in ['1', '2', '3']:
             claude_msgs = [{'role': 'user', 'content': incoming_msg}, {'role': 'assistant', 'content': WELCOME_MSG}]
             db.save_conversation(from_number, claude_msgs, None)
             send_whatsapp_message(from_number, WELCOME_MSG)
-            if msg_stripped == '3':
-                return avvia_flusso_modifica(from_number, claude_msgs)
-            if msg_stripped == '4':
-                return INFO_MSG
             if msg_stripped == '2':
-                incoming_msg = 'Vorrei prenotare un tagliando'
-            else:
-                incoming_msg = 'Ho un problema con la mia auto'
+                return avvia_flusso_modifica(from_number, claude_msgs)
+            if msg_stripped == '3':
+                return INFO_MSG
+            incoming_msg = 'Ho un problema con la mia auto'
             messages = claude_msgs
             # Prosegui al flusso Claude sotto
         else:
@@ -677,16 +794,12 @@ def process_message(from_number, incoming_msg):
             return WELCOME_MSG
     # Gestione risposte rapide dal menu
     msg_stripped = incoming_msg.strip()
-    if not pending_slots and msg_stripped in ['1', '2']:
-        # Opzione 1 o 2: avvia triage (per il tagliando, simula un messaggio iniziale)
-        if msg_stripped == '2':
-            incoming_msg = 'Vorrei prenotare un tagliando'
-        else:
-            incoming_msg = 'Ho un problema con la mia auto'
+    if not pending_slots and msg_stripped == '1':
+        incoming_msg = 'Ho un problema con la mia auto'
         # Lascia proseguire al flusso Claude normale sotto
-    elif not pending_slots and msg_stripped == '3':
+    elif not pending_slots and msg_stripped == '2':
         return avvia_flusso_modifica(from_number, messages)
-    elif not pending_slots and msg_stripped == '4':
+    elif not pending_slots and msg_stripped == '3':
         return INFO_MSG
     # Rileva intent spostamento/cancellazione (solo se non c'è già un flusso in corso)
     if not pending_slots and is_reschedule_intent(incoming_msg):
@@ -696,11 +809,26 @@ def process_message(from_number, incoming_msg):
         if result:
             return result
     claude_msgs = [m for m in messages if isinstance(m, dict) and 'role' in m]
-    claude_msgs.append({'role': 'user', 'content': incoming_msg})
+    # Costruisci il contenuto del messaggio utente (testo + eventuale immagine)
+    if image:
+        b64_data, media_type = image
+        user_content = [
+            {'type': 'image', 'source': {'type': 'base64', 'media_type': media_type, 'data': b64_data}},
+            {'type': 'text', 'text': incoming_msg},
+        ]
+        # Salva nella conversazione solo il testo (le immagini non si ri-inviano nelle conversazioni successive)
+        claude_msgs.append({'role': 'user', 'content': incoming_msg})
+        # Per la chiamata a Claude, usa i messaggi precedenti + l'ultimo con immagine
+        claude_msgs_for_api = claude_msgs[:-1] + [{'role': 'user', 'content': user_content}]
+        # Salva riferimento foto per il DB
+        _save_photo_for_booking(from_number, b64_data, media_type)
+    else:
+        claude_msgs.append({'role': 'user', 'content': incoming_msg})
+        claude_msgs_for_api = claude_msgs
     try:
         response = claude_client.messages.create(
             model='claude-sonnet-4-6', max_tokens=1000,
-            system=SYSTEM_PROMPT, messages=claude_msgs,
+            system=SYSTEM_PROMPT, messages=claude_msgs_for_api,
         )
         reply = response.content[0].text
     except Exception as e:
@@ -769,6 +897,7 @@ def webhook():
 
         msg_type = msg.get('type')
         text = None
+        image_data = None  # (base64, media_type) se presente
 
         if msg_type == 'text':
             text = msg.get('text', {}).get('body', '').strip()
@@ -778,22 +907,579 @@ def webhook():
                 text = transcribe_audio(audio_id)
                 if not text:
                     send_whatsapp_message(phone, 'Non sono riuscito a capire il vocale. Puoi ripetere o scrivere?')
+        elif msg_type == 'image':
+            img = msg.get('image', {})
+            image_id = img.get('id', '')
+            caption = img.get('caption', '').strip()
+            text = caption if caption else 'Il cliente ha inviato una foto.'
+            if image_id:
+                b64, media_type = download_image_as_base64(image_id)
+                if b64:
+                    image_data = (b64, media_type)
+                else:
+                    send_whatsapp_message(phone, 'Non sono riuscito a scaricare la foto. Puo\' riprovare?')
 
         if text:
+            img = image_data  # cattura per il thread
             def process_and_send():
                 lock = get_user_lock(phone)
                 with lock:
-                    reply = process_message(phone, text)
+                    reply = process_message(phone, text, image=img)
                     send_whatsapp_message(phone, reply)
             threading.Thread(target=process_and_send, daemon=True).start()
-        elif msg_type not in ('text', 'audio'):
-            send_whatsapp_message(phone, 'Posso elaborare solo messaggi di testo e vocali.')
+        elif msg_type not in ('text', 'audio', 'image'):
+            send_whatsapp_message(phone, 'Posso elaborare messaggi di testo, vocali e foto.')
     except Exception as e:
         logger.error('Webhook errore: ' + str(e))
     return 'OK', 200
 
+app.secret_key = os.environ.get('FLASK_SECRET_KEY', 'chatbot-officina-secret-key-2024')
+
+# --- PAGINA CAPOFFICINA ---
+
+ADMIN_LOGIN_HTML = '''
+<!DOCTYPE html>
+<html lang="it">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Login - ''' + NOME + '''</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+               background: #f0f2f5; display: flex; justify-content: center; align-items: center; min-height: 100vh; }
+        .login-box { background: white; padding: 40px; border-radius: 12px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+                     width: 90%%; max-width: 400px; text-align: center; }
+        .login-box h1 { font-size: 24px; margin-bottom: 8px; color: #1a1a1a; }
+        .login-box p { color: #666; margin-bottom: 24px; }
+        input[type="password"] { width: 100%%; padding: 12px 16px; border: 1px solid #ddd; border-radius: 8px;
+                                  font-size: 16px; margin-bottom: 16px; }
+        button { width: 100%%; padding: 12px; background: #25D366; color: white; border: none; border-radius: 8px;
+                 font-size: 16px; font-weight: bold; cursor: pointer; }
+        button:hover { background: #1da851; }
+        .error { color: #e74c3c; margin-bottom: 16px; font-size: 14px; }
+    </style>
+</head>
+<body>
+    <div class="login-box">
+        <h1>&#x1f527; ''' + NOME + '''</h1>
+        <p>Area Capofficina</p>
+        {% if error %}<div class="error">{{ error }}</div>{% endif %}
+        <form method="POST">
+            <input type="password" name="password" placeholder="Password" required autofocus>
+            <button type="submit">Accedi</button>
+        </form>
+    </div>
+</body>
+</html>
+'''
+
+ADMIN_PAGE_HTML = '''
+<!DOCTYPE html>
+<html lang="it">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Capofficina - ''' + NOME + '''</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+               background: #f0f2f5; }
+        .header { background: #075E54; color: white; padding: 16px 20px; display: flex;
+                  justify-content: space-between; align-items: center; }
+        .header h1 { font-size: 20px; }
+        .header a { color: white; text-decoration: none; font-size: 14px; opacity: 0.8; }
+        .header a:hover { opacity: 1; }
+        .container { max-width: 800px; margin: 20px auto; padding: 0 16px; }
+        .card { background: white; border-radius: 12px; box-shadow: 0 1px 4px rgba(0,0,0,0.1);
+                margin-bottom: 12px; padding: 16px; display: flex; justify-content: space-between;
+                align-items: center; flex-wrap: wrap; gap: 12px; }
+        .card-info { flex: 1; min-width: 200px; }
+        .card-info .name { font-weight: bold; font-size: 16px; color: #1a1a1a; }
+        .card-info .details { font-size: 14px; color: #666; margin-top: 4px; }
+        .card-info .slot { font-size: 14px; color: #075E54; font-weight: 500; margin-top: 4px; }
+        .card-info .problem { font-size: 13px; color: #888; margin-top: 4px; font-style: italic; }
+        .card-photos { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+        .card-photos img { width: 60px; height: 60px; object-fit: cover; border-radius: 6px;
+                           border: 1px solid #ddd; cursor: pointer; transition: transform 0.2s; }
+        .card-photos img:hover { transform: scale(1.1); }
+        .photo-modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+                       background: rgba(0,0,0,0.8); z-index: 1000; justify-content: center; align-items: center; }
+        .photo-modal img { max-width: 90%; max-height: 90%; border-radius: 8px; }
+        .photo-modal.active { display: flex; }
+        .btn-group { display: flex; flex-direction: column; gap: 8px; }
+        .btn-avvisa { padding: 10px 20px; background: #25D366; color: white; border: none;
+                      border-radius: 8px; font-size: 14px; font-weight: bold; cursor: pointer;
+                      white-space: nowrap; }
+        .btn-avvisa:hover { background: #1da851; }
+        .btn-avvisa:disabled { background: #ccc; cursor: not-allowed; }
+        .btn-avvisa.sent { background: #27ae60; }
+        .btn-non-pronta { padding: 10px 20px; background: #e67e22; color: white; border: none;
+                          border-radius: 8px; font-size: 14px; font-weight: bold; cursor: pointer;
+                          white-space: nowrap; }
+        .btn-non-pronta:hover { background: #d35400; }
+        .btn-non-pronta:disabled { background: #ccc; cursor: not-allowed; }
+        .empty { text-align: center; padding: 60px 20px; color: #999; font-size: 16px; }
+        .flash { max-width: 800px; margin: 12px auto; padding: 12px 20px; border-radius: 8px;
+                 font-size: 14px; }
+        .flash.success { background: #d4edda; color: #155724; }
+        .flash.error { background: #f8d7da; color: #721c24; }
+        .priority { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 12px;
+                    font-weight: bold; margin-left: 8px; }
+        .priority.CRITICA { background: #ffe0e0; color: #c0392b; }
+        .priority.ALTA { background: #fff3e0; color: #e67e22; }
+        .priority.MEDIA { background: #fff9e0; color: #f39c12; }
+        .priority.BASSA { background: #e0f7e0; color: #27ae60; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>&#x1f527; Capofficina</h1>
+        <a href="/admin/logout">Esci</a>
+    </div>
+    {% if flash_msg %}
+    <div class="flash {{ flash_type }}">{{ flash_msg }}</div>
+    {% endif %}
+    <div class="container">
+        {% if bookings %}
+            {% for b in bookings %}
+            <div class="card">
+                <div class="card-info">
+                    <div class="name">
+                        {{ b.nome_cliente or b.customer_name or 'Cliente' }}
+                        {% if b.priority %}
+                        <span class="priority {{ b.priority }}">{{ b.priority }}</span>
+                        {% endif %}
+                    </div>
+                    <div class="details">&#x1f697; {{ b.auto_cliente or 'N/D' }}</div>
+                    <div class="slot">&#x1f4c5; {{ b.slot_display or 'N/D' }}</div>
+                    {% if b.summary %}
+                    <div class="problem">&#x1f4dd; {{ b.summary }}</div>
+                    {% endif %}
+                    {% if b.photos %}
+                    <div class="card-photos">
+                        {% for p in b.photos %}
+                        <img src="/admin/photo/{{ p.id }}" alt="Foto cliente"
+                             onclick="document.getElementById('modal').classList.add('active'); document.getElementById('modal-img').src=this.src;">
+                        {% endfor %}
+                    </div>
+                    {% endif %}
+                </div>
+                <div class="btn-group">
+                    <form method="POST" action="/admin/avvisa">
+                        <input type="hidden" name="booking_id" value="{{ b.id }}">
+                        <input type="hidden" name="phone" value="{{ b.phone }}">
+                        <input type="hidden" name="nome" value="{{ b.nome_cliente or b.customer_name or 'Cliente' }}">
+                        <input type="hidden" name="auto" value="{{ b.auto_cliente or '' }}">
+                        <button type="submit" class="btn-avvisa"
+                                onclick="this.disabled=true; this.innerText='Invio...'; this.form.submit();">
+                            &#x2705; Auto Pronta
+                        </button>
+                    </form>
+                    <form method="POST" action="/admin/non-pronta">
+                        <input type="hidden" name="booking_id" value="{{ b.id }}">
+                        <input type="hidden" name="phone" value="{{ b.phone }}">
+                        <input type="hidden" name="nome" value="{{ b.nome_cliente or b.customer_name or 'Cliente' }}">
+                        <input type="hidden" name="auto" value="{{ b.auto_cliente or '' }}">
+                        <button type="submit" class="btn-non-pronta"
+                                onclick="this.disabled=true; this.innerText='Invio...'; this.form.submit();">
+                            &#x23f3; Auto Non Pronta
+                        </button>
+                    </form>
+                </div>
+            </div>
+            {% endfor %}
+        {% else %}
+            <div class="empty">Nessuna prenotazione attiva al momento.</div>
+        {% endif %}
+    </div>
+    <div class="photo-modal" id="modal" onclick="this.classList.remove('active');">
+        <img id="modal-img" src="">
+    </div>
+</body>
+</html>
+'''
+
+
+@app.route('/admin', methods=['GET', 'POST'])
+def admin_login():
+    if session.get('admin'):
+        return redirect('/admin/dashboard')
+    error = None
+    if request.method == 'POST':
+        if request.form.get('password') == ADMIN_PASSWORD:
+            session['admin'] = True
+            return redirect('/admin/dashboard')
+        error = 'Password errata'
+    return render_template_string(ADMIN_LOGIN_HTML, error=error)
+
+
+@app.route('/admin/dashboard')
+def admin_dashboard():
+    if not session.get('admin'):
+        return redirect('/admin')
+    flash_msg = request.args.get('msg')
+    flash_type = request.args.get('type', 'success')
+    bookings = db.get_active_bookings()
+    # Carica le foto per ogni prenotazione
+    for b in bookings:
+        b['photos'] = db.get_photos_for_booking(b['id'])
+    return render_template_string(ADMIN_PAGE_HTML, bookings=bookings,
+                                  flash_msg=flash_msg, flash_type=flash_type)
+
+
+@app.route('/admin/photo/<int:photo_id>')
+def admin_photo(photo_id):
+    if not session.get('admin'):
+        return redirect('/admin')
+    from flask import Response
+    photo = db.get_photo_data(photo_id)
+    if not photo:
+        return 'Not found', 404
+    image_bytes = base64.b64decode(photo['image_data'])
+    return Response(image_bytes, mimetype=photo['media_type'])
+
+
+@app.route('/admin/avvisa', methods=['POST'])
+def admin_avvisa():
+    if not session.get('admin'):
+        return redirect('/admin')
+    phone = request.form.get('phone', '')
+    nome = request.form.get('nome', '')
+    auto = request.form.get('auto', '')
+    ok, err = send_template_message(phone, TEMPLATE_NAME, [nome, auto])
+    if ok:
+        return redirect('/admin/dashboard?msg=Messaggio+inviato+a+' + nome + '&type=success')
+    else:
+        return redirect('/admin/dashboard?msg=Errore:+' + err[:80] + '&type=error')
+
+
+@app.route('/admin/non-pronta', methods=['POST'])
+def admin_non_pronta():
+    if not session.get('admin'):
+        return redirect('/admin')
+    phone = request.form.get('phone', '')
+    nome = request.form.get('nome', '')
+    auto = request.form.get('auto', '')
+    ok, err = send_template_message(phone, TEMPLATE_NON_PRONTA, [nome, auto])
+    if ok:
+        return redirect('/admin/dashboard?msg=Avviso+auto+non+pronta+inviato+a+' + nome + '&type=success')
+    else:
+        return redirect('/admin/dashboard?msg=Errore:+' + err[:80] + '&type=error')
+
+
+@app.route('/admin/logout')
+def admin_logout():
+    session.pop('admin', None)
+    return redirect('/admin')
+
+
+# --- PROMEMORIA AUTOMATICI ---
+
+def invia_promemoria():
+    """Controlla prenotazioni di domani e invia promemoria ai clienti."""
+    try:
+        bookings = db.get_tomorrow_bookings()
+        if not bookings:
+            logger.info('Promemoria: nessuna prenotazione per domani')
+            return
+        for b in bookings:
+            nome = b.get('nome_cliente', 'Cliente')
+            orario = 'ore ' + b.get('slot_time', '')
+            phone = b.get('phone', '')
+            ok, err = send_template_message(phone, TEMPLATE_PROMEMORIA, [nome, orario])
+            if ok:
+                db.mark_promemoria_sent(b['id'])
+                logger.info('Promemoria inviato a ' + nome + ' (' + phone + ')')
+            else:
+                logger.error('Promemoria fallito per ' + phone + ': ' + err)
+    except Exception as e:
+        logger.error('Errore invio promemoria: ' + str(e))
+
+
+def scheduler_promemoria():
+    """Esegue il controllo promemoria ogni ora."""
+    import time
+    while True:
+        now = datetime.now(TZ_ROME)
+        # Invia promemoria solo tra le 9 e le 20
+        if 9 <= now.hour <= 20:
+            invia_promemoria()
+        time.sleep(3600)  # Ogni ora
+
+
+# ============================================================
+# API PER BRO CAR AI AGENT
+# ============================================================
+
+AGENT_API_KEY = os.environ.get('AGENT_API_KEY', 'brocar-agent-2026')
+
+
+def require_agent_key(f):
+    """Decorator per proteggere le API con chiave."""
+    from functools import wraps
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        key = request.headers.get('X-Agent-Key', '') or request.args.get('key', '')
+        if key != AGENT_API_KEY:
+            return {'error': 'Unauthorized'}, 401
+        return f(*args, **kwargs)
+    return decorated
+
+
+@app.route('/api/agent/kpi', methods=['GET'])
+@require_agent_key
+def agent_kpi():
+    """KPI per la dashboard BRO CAR AI AGENT."""
+    conn = db.get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute('SELECT COUNT(*) as totale FROM bookings')
+            totale_prenotazioni = cur.fetchone()['totale']
+
+            cur.execute("SELECT COUNT(*) as oggi FROM bookings WHERE slot_date = CURRENT_DATE")
+            prenotazioni_oggi = cur.fetchone()['oggi']
+
+            cur.execute('SELECT COUNT(*) as totale FROM conversations')
+            totale_conversazioni = cur.fetchone()['totale']
+
+            cur.execute('SELECT COUNT(*) as attive FROM conversations WHERE active = true')
+            conversazioni_attive = cur.fetchone()['attive']
+
+            cur.execute('SELECT COUNT(DISTINCT phone) as clienti FROM customers')
+            clienti_unici = cur.fetchone()['clienti']
+
+            cur.execute('SELECT COALESCE(AVG(rating), 0) as media, COUNT(*) as totale FROM feedback')
+            fb = cur.fetchone()
+
+            cur.execute("""
+                SELECT COUNT(*) as settimana FROM bookings
+                WHERE slot_date >= date_trunc('week', CURRENT_DATE)
+                AND slot_date < date_trunc('week', CURRENT_DATE) + interval '7 days'
+            """)
+            prenotazioni_settimana = cur.fetchone()['settimana']
+
+            cur.execute("""
+                SELECT COUNT(*) as mese FROM bookings
+                WHERE slot_date >= date_trunc('month', CURRENT_DATE)
+                AND slot_date < date_trunc('month', CURRENT_DATE) + interval '1 month'
+            """)
+            prenotazioni_mese = cur.fetchone()['mese']
+
+        return {
+            'prenotazioni_totali': totale_prenotazioni,
+            'prenotazioni_oggi': prenotazioni_oggi,
+            'prenotazioni_settimana': prenotazioni_settimana,
+            'prenotazioni_mese': prenotazioni_mese,
+            'conversazioni_totali': totale_conversazioni,
+            'conversazioni_attive': conversazioni_attive,
+            'clienti_unici': clienti_unici,
+            'feedback_medio': round(float(fb['media']), 1),
+            'feedback_totale': fb['totale']
+        }
+    finally:
+        conn.close()
+
+
+@app.route('/api/agent/prenotazioni', methods=['GET'])
+@require_agent_key
+def agent_prenotazioni():
+    """Tutte le prenotazioni."""
+    conn = db.get_conn()
+    try:
+        with conn.cursor() as cur:
+            limit = request.args.get('limit', 50, type=int)
+            cur.execute("""
+                SELECT b.id, b.phone, b.nome_cliente, b.auto_cliente, b.status,
+                       b.slot_date::text, b.slot_time, b.slot_display, b.created_at::text,
+                       t.category, t.priority, t.summary, t.recommendation
+                FROM bookings b
+                LEFT JOIN triage_results t ON b.triage_id = t.id
+                ORDER BY b.slot_date DESC, b.slot_time DESC
+                LIMIT %s
+            """, (limit,))
+            return {'data': cur.fetchall()}
+    finally:
+        conn.close()
+
+
+@app.route('/api/agent/prenotazioni/oggi', methods=['GET'])
+@require_agent_key
+def agent_prenotazioni_oggi():
+    """Prenotazioni di oggi."""
+    conn = db.get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT b.id, b.phone, b.nome_cliente, b.auto_cliente, b.status,
+                       b.slot_date::text, b.slot_time, b.slot_display,
+                       t.category, t.priority, t.summary
+                FROM bookings b
+                LEFT JOIN triage_results t ON b.triage_id = t.id
+                WHERE b.slot_date = CURRENT_DATE
+                ORDER BY b.slot_time ASC
+            """)
+            return {'data': cur.fetchall()}
+    finally:
+        conn.close()
+
+
+@app.route('/api/agent/clienti', methods=['GET'])
+@require_agent_key
+def agent_clienti():
+    """Lista clienti con statistiche."""
+    conn = db.get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT c.phone, c.name, c.created_at::text,
+                       COUNT(DISTINCT b.id) as num_prenotazioni,
+                       COUNT(DISTINCT conv.id) as num_conversazioni
+                FROM customers c
+                LEFT JOIN bookings b ON c.phone = b.phone
+                LEFT JOIN conversations conv ON c.phone = conv.phone
+                GROUP BY c.phone, c.name, c.created_at
+                ORDER BY c.created_at DESC
+            """)
+            return {'data': cur.fetchall()}
+    finally:
+        conn.close()
+
+
+@app.route('/api/agent/feedback', methods=['GET'])
+@require_agent_key
+def agent_feedback():
+    """Lista feedback."""
+    conn = db.get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT f.rating, f.comment, f.created_at::text, f.phone,
+                       b.nome_cliente, b.auto_cliente, b.slot_date::text, b.slot_time
+                FROM feedback f
+                LEFT JOIN bookings b ON f.booking_id = b.id
+                ORDER BY f.created_at DESC
+            """)
+            return {'data': cur.fetchall()}
+    finally:
+        conn.close()
+
+
+@app.route('/api/agent/triage', methods=['GET'])
+@require_agent_key
+def agent_triage():
+    """Lista triage."""
+    conn = db.get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, phone, category, priority, summary, recommendation,
+                       emotional_note, created_at::text
+                FROM triage_results
+                ORDER BY created_at DESC
+                LIMIT 50
+            """)
+            return {'data': cur.fetchall()}
+    finally:
+        conn.close()
+
+
+@app.route('/api/agent/chart/prenotazioni-mese', methods=['GET'])
+@require_agent_key
+def agent_chart_prenotazioni_mese():
+    """Prenotazioni per giorno (ultimo mese)."""
+    conn = db.get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT slot_date::text as giorno, COUNT(*) as totale
+                FROM bookings
+                WHERE slot_date >= CURRENT_DATE - interval '30 days'
+                GROUP BY slot_date ORDER BY slot_date
+            """)
+            return {'data': cur.fetchall()}
+    finally:
+        conn.close()
+
+
+@app.route('/api/agent/chart/priorita', methods=['GET'])
+@require_agent_key
+def agent_chart_priorita():
+    """Distribuzione per priorita."""
+    conn = db.get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT t.priority, COUNT(*) as totale
+                FROM bookings b
+                JOIN triage_results t ON b.triage_id = t.id
+                GROUP BY t.priority ORDER BY totale DESC
+            """)
+            return {'data': cur.fetchall()}
+    finally:
+        conn.close()
+
+
+@app.route('/api/agent/chart/categorie', methods=['GET'])
+@require_agent_key
+def agent_chart_categorie():
+    """Distribuzione per categoria."""
+    conn = db.get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT category, COUNT(*) as totale
+                FROM triage_results
+                GROUP BY category ORDER BY totale DESC
+            """)
+            return {'data': cur.fetchall()}
+    finally:
+        conn.close()
+
+
+@app.route('/api/agent/chart/conversazioni', methods=['GET'])
+@require_agent_key
+def agent_chart_conversazioni():
+    """Conversazioni per giorno (ultimo mese)."""
+    conn = db.get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT created_at::date::text as giorno, COUNT(*) as totale
+                FROM conversations
+                WHERE created_at >= CURRENT_DATE - interval '30 days'
+                GROUP BY created_at::date ORDER BY created_at::date
+            """)
+            return {'data': cur.fetchall()}
+    finally:
+        conn.close()
+
+
+@app.route('/api/agent/query', methods=['POST'])
+@require_agent_key
+def agent_query():
+    """Query SQL di sola lettura per la chat AI."""
+    data = request.get_json()
+    sql = data.get('sql', '')
+    if not sql.strip().upper().startswith('SELECT'):
+        return {'error': 'Solo query SELECT permesse'}, 400
+    conn = db.get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            return {'data': cur.fetchall()}
+    except Exception as e:
+        return {'error': str(e)}, 400
+    finally:
+        conn.close()
+
+
 # Inizializza il database all'avvio
 db.init_db()
+
+# Avvia il thread promemoria
+threading.Thread(target=scheduler_promemoria, daemon=True).start()
+logger.info('Thread promemoria avviato')
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
